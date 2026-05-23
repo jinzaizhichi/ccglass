@@ -110,6 +110,14 @@ Node ≥ 18. The core proxy + dashboard have no runtime dependencies; the
 optional MCP self-inspection feature (`ccglass claude`) pulls in
 `@modelcontextprotocol/sdk` and `zod`.
 
+## Issues
+
+Open an [issue](https://github.com/jianshuo/ccglass/issues/new) and Claude picks
+it up automatically — it investigates against the code, and if it's a real,
+well-scoped bug or small feature, opens a fix PR that references your issue. Keep
+iterating by commenting `@claude` on the issue or the PR. Claude only ever opens
+PRs for review; a maintainer merges and releases.
+
 ## Acknowledgments
 
 Heartfelt thanks to **庄表伟 ([@zhuangbiaowei](https://github.com/zhuangbiaowei))** for
