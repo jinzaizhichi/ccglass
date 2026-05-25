@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { packRecord, unpackRecord, gcBlobs } from "./blobs.js";
 
 const mask = (v) =>
   String(v)
@@ -53,15 +54,21 @@ export class Store extends EventEmitter {
       request: { ...request, headers: this._maskHeaders(request.headers) },
       response: null,
     };
-    fs.writeFileSync(this._file(seq), JSON.stringify(rec, null, 2));
+    this._persist(rec);
     this.entries.push(rec);
     this.emit("entry", rec);
     return rec;
   }
 
   update(rec) {
-    fs.writeFileSync(this._file(rec.seq), JSON.stringify(rec, null, 2));
+    this._persist(rec);
     this.emit("update", rec);
+  }
+
+  // Write the v2 manifest (request content split into content-addressed blobs).
+  _persist(rec) {
+    const manifest = packRecord(this.root, rec);
+    fs.writeFileSync(this._file(rec.seq), JSON.stringify(manifest, null, 2));
   }
 
   list() {
@@ -109,7 +116,7 @@ export function listSessions(root) {
   if (!fs.existsSync(root)) return [];
   return fs
     .readdirSync(root, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
+    .filter((d) => d.isDirectory() && d.name !== "blobs")
     .map((d) => d.name)
     .sort()
     .reverse();
@@ -147,13 +154,39 @@ function shouldReplaceRecord(prev, rec, prevMtime, newMtime) {
 }
 
 /** Read one capture file; returns null on parse errors. Normalizes id to the path key. */
-function readRecordFile(file, id) {
+function readRecordFile(file, id, root) {
+  let raw;
   try {
-    const rec = JSON.parse(fs.readFileSync(file, "utf8"));
-    rec.id = id;
-    return rec;
+    raw = JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
     return null;
+  }
+  if (raw && raw.v === 2) {
+    try {
+      const rec = unpackRecord(root, raw);
+      rec.id = id;
+      return rec;
+    } catch {
+      return null;
+    }
+  }
+  // Legacy full record: hand it back, and opportunistically repack to v2 in place.
+  raw.id = id;
+  tryMigrate(file, root, raw);
+  return raw;
+}
+
+// Repack a legacy full record into a v2 manifest on disk. Atomic (temp + rename)
+// and best-effort: a read-only root (e.g. a legacy ./.ccglass) is silently skipped
+// so migration failure never breaks a read.
+function tryMigrate(file, root, rec) {
+  try {
+    const manifest = packRecord(root, rec);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2));
+    fs.renameSync(tmp, file);
+  } catch {
+    /* read-only root or transient error — keep serving reads */
   }
 }
 
@@ -186,7 +219,7 @@ export function loadSessionMulti(roots, session) {
       const st = fs.statSync(file);
       const prev = byId.get(id);
 
-      const rec = readRecordFile(file, id);
+      const rec = readRecordFile(file, id, root);
       if (!rec) continue;
 
       if (prev) {
@@ -243,7 +276,7 @@ export function loadSession(root, session) {
   const out = [];
   for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".json")).sort()) {
     const seq = f.replace(/\.json$/, "");
-    const rec = readRecordFile(path.join(dir, f), `${session}/${seq}`);
+    const rec = readRecordFile(path.join(dir, f), `${session}/${seq}`, root);
     if (rec) out.push(rec);
   }
   return out;
@@ -254,5 +287,11 @@ export function readEntryById(root, id) {
   if (!parts) return null;
   const file = path.join(root, parts.session, `${parts.seq}.json`);
   if (!fs.existsSync(file)) return null;
-  return readRecordFile(file, id);
+  return readRecordFile(file, id, root);
+}
+
+/** Delete a session directory under `root`, then GC now-orphaned blobs. */
+export function rmSession(root, session) {
+  fs.rmSync(path.join(root, session), { recursive: true, force: true });
+  gcBlobs(root, listSessions, (r, s) => path.join(r, s));
 }

@@ -317,3 +317,133 @@ test("readEntryByIdMulti prefers the newer duplicate across roots", () => {
   fs.rmSync(a, { recursive: true, force: true });
   fs.rmSync(b, { recursive: true, force: true });
 });
+
+test("Store writes a v2 manifest with blob refs; in-memory rec stays full", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccglass-v2-"));
+  const store = new Store({ root });
+  const rec = store.add({
+    request: {
+      method: "POST", url: "/v1/messages",
+      headers: { authorization: "Bearer sk-ant-oat01-SECRETSECRETSECRET-TAIL" },
+      body: { model: "m", messages: [{ role: "user", content: "hi" }], tools: [] },
+    },
+  });
+  rec.response = { status: 200, raw: "ok" };
+  store.update(rec);
+
+  const seqFile = path.join(root, store.sessionId, "0001.json");
+  const onDisk = JSON.parse(fs.readFileSync(seqFile, "utf8"));
+  assert.equal(onDisk.v, 2);
+  assert.ok(Array.isArray(onDisk.request.messages));
+  assert.match(onDisk.request.messages[0], /^sha256:/);
+  assert.equal(onDisk.request.body, undefined);
+
+  assert.deepEqual(rec.request.body.messages, [{ role: "user", content: "hi" }]);
+
+  assert.ok(fs.existsSync(path.join(root, "blobs")));
+});
+
+test("v2 manifests are reconstructed transparently by loadSession/readEntryById", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccglass-r2-"));
+  const store = new Store({ root });
+  const rec = store.add({
+    request: {
+      method: "POST", url: "/v1/messages", headers: {},
+      body: { model: "m", system: [{ type: "text", text: "s" }],
+              messages: [{ role: "user", content: "hi" }], tools: [{ name: "t" }] },
+    },
+  });
+  rec.response = { status: 200, raw: "ok" };
+  store.update(rec);
+
+  const session = store.sessionId;
+  const loaded = loadSession(root, session);
+  assert.equal(loaded.length, 1);
+  assert.deepEqual(loaded[0].request.body.messages, [{ role: "user", content: "hi" }]);
+  assert.deepEqual(loaded[0].request.body.system, [{ type: "text", text: "s" }]);
+  assert.deepEqual(loaded[0].request.body.tools, [{ name: "t" }]);
+
+  const one = readEntryById(root, `${session}/0001`);
+  assert.equal(one.response.status, 200);
+  assert.deepEqual(one.request.body.messages, [{ role: "user", content: "hi" }]);
+});
+
+test("listSessions ignores the blobs directory", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccglass-ls-"));
+  const store = new Store({ root });
+  const rec = store.add({ request: { method: "POST", url: "/x", headers: {},
+    body: { model: "m", messages: [{ role: "user", content: "hi" }], tools: [] } } });
+  rec.response = { status: 200 }; store.update(rec);
+  const sessions = listSessions(root); // listSessions must already be imported at top of file
+  assert.deepEqual(sessions, [store.sessionId]); // NOT ["blobs", ...]
+});
+
+test("legacy NNNN.json is repacked to v2 in place on read, idempotently", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccglass-mig-"));
+  const session = "2020-01-01T00-00-00-000Z";
+  const dir = path.join(root, session);
+  fs.mkdirSync(dir, { recursive: true });
+  const legacy = {
+    id: `${session}/0001`, session, seq: 1, ts: 1, format: "anthropic",
+    request: { headers: {}, body: { model: "m", messages: [{ role: "user", content: "hi" }], tools: [] } },
+    response: { status: 200, raw: "ok" },
+  };
+  const file = path.join(dir, "0001.json");
+  fs.writeFileSync(file, JSON.stringify(legacy, null, 2));
+
+  const loaded = loadSession(root, session);
+  assert.deepEqual(loaded[0].request.body.messages, [{ role: "user", content: "hi" }]);
+  const afterFirst = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(afterFirst.v, 2);
+
+  const reloaded = loadSession(root, session);
+  assert.deepEqual(reloaded[0].request.body.messages, [{ role: "user", content: "hi" }]);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).v, 2);
+});
+
+test("a corrupt v2 manifest yields null, not a thrown error", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccglass-corrupt-"));
+  const session = "2020-02-02T00-00-00-000Z";
+  const dir = path.join(root, session);
+  fs.mkdirSync(dir, { recursive: true });
+  // historyKey set but messages is a non-array → (messages||[]).map throws inside unpackRecord
+  fs.writeFileSync(path.join(dir, "0001.json"), JSON.stringify({
+    v: 2, id: `${session}/0001`, session, seq: 1, ts: 1, format: "anthropic",
+    request: { headers: {}, meta: { model: "m" }, historyKey: "messages", system: null, tools: null, messages: "not-an-array" },
+    response: null,
+  }));
+  const loaded = loadSession(root, session); // (use whatever name loadSession is imported as)
+  assert.equal(loaded.length, 0); // corrupt entry is dropped (readRecordFile returned null), not thrown
+});
+
+function countBlobs(root) {
+  const blobsDir = path.join(root, "blobs");
+  if (!fs.existsSync(blobsDir)) return 0;
+  let n = 0;
+  for (const shard of fs.readdirSync(blobsDir)) {
+    n += fs.readdirSync(path.join(blobsDir, shard)).filter((f) => f.endsWith(".json")).length;
+  }
+  return n;
+}
+
+test("growing-prefix sessions store O(N) blobs, not O(N^2)", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ccglass-dedup-"));
+  const store = new Store({ root });
+  const N = 20;
+  const messages = [];
+  const tools = [{ name: "t", description: "x".repeat(500) }]; // identical every call
+  for (let i = 0; i < N; i++) {
+    messages.push({ role: "user", content: `turn ${i}` });
+    messages.push({ role: "assistant", content: `reply ${i}` });
+    const rec = store.add({
+      request: { method: "POST", url: "/v1/messages", headers: {},
+        body: { model: "m", tools, messages: messages.map((m) => ({ ...m })) } },
+    });
+    rec.response = { status: 200, raw: "ok" };
+    store.update(rec);
+  }
+  // Unique blobs: 2N messages + 1 tools blob (deduped across all calls). The O(N^2)
+  // model would have stored ~N*(2N) message copies. Allow a small margin.
+  const blobs = countBlobs(root);
+  assert.ok(blobs <= 2 * N + 5, `expected ~${2 * N + 1} blobs, got ${blobs}`);
+});
