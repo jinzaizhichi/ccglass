@@ -70,6 +70,8 @@ test("bedrock keys off ANTHROPIC_BEDROCK_BASE_URL, not ANTHROPIC_BASE_URL", asyn
   assert.match(stderr, /AWS Bedrock/);
   assert.match(stderr, /ANTHROPIC_BEDROCK_BASE_URL/);
   assert.doesNotMatch(stderr, /Set ANTHROPIC_BASE_URL/);
+});
+
 test("claude uses ANTHROPIC_BASE_URL env var as upstream (invalid URL triggers clear error)", async () => {
   const { code, stderr } = await run(["claude"], { ANTHROPIC_BASE_URL: "not-a-valid-url" });
 

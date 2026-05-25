@@ -186,6 +186,16 @@ function detectCodexChatGPTAuth() {
   });
 }
 
+// Read model_providers.*.base_url from ~/.codex/config.toml. Codex prioritizes
+// config.toml over OPENAI_BASE_URL, so we must read the configured upstream from
+// there and override it via -c flag when spawning codex.
+function codexConfigBaseUrl() {
+  const configPath = path.join(os.homedir(), ".codex", "config.toml");
+  if (!fs.existsSync(configPath)) return null;
+  const toml = fs.readFileSync(configPath, "utf8");
+  const m = toml.match(/^\[model_providers\.(\S+)\][^\[]*?^base_url\s*=\s*"([^"]+)"/m);
+  return m ? { provider: m[1], baseUrl: m[2] } : null;
+}
 // Read the provider's base-URL env var from Claude Code's settings.json env
 // block. A provider switcher (cc-switch etc.) writes the active provider's base
 // URL here, which otherwise makes claude bypass our proxy. Project settings
@@ -225,7 +235,11 @@ async function wrap(command, args, opts) {
   // user didn't override --upstream, forward there by default (the plain claude
   // provider's default upstream is anthropic.com; kimi etc. keep their own).
   const settingsBaseUrl = claudeBased ? settingsEnvBaseUrl(provider.envVar) : null;
-  let upstream = opts.upstream || (provider.upstream === "auto" ? null : provider.upstream);
+  const codexBased = provider.command === "codex" && !provider.autoUpstream;
+  const codexConfig = codexBased ? codexConfigBaseUrl() : null;
+  let upstream = opts.upstream
+    || (codexConfig && codexConfig.baseUrl)
+    || (provider.upstream === "auto" ? null : provider.upstream);
   // autoUpstream: resolve upstream from the same env var we're about to override
   if (!upstream && provider.autoUpstream) upstream = process.env[provider.envVar];
   // Picking the upstream from settings.json covers two cases: vanilla Claude
@@ -235,6 +249,9 @@ async function wrap(command, args, opts) {
   if (!opts.upstream && settingsBaseUrl && (provider.upstream === "https://api.anthropic.com" || provider.autoUpstream)) {
     upstream = settingsBaseUrl;
     process.stderr.write(`  \x1b[36m●\x1b[0m ccglass: upstream from Claude Code settings.json → ${upstream}\n`);
+  }
+  if (!opts.upstream && codexConfig) {
+    process.stderr.write(`  \x1b[36m●\x1b[0m ccglass: upstream from Codex config.toml → ${codexConfig.baseUrl}\n`);
   }
   // A provider switcher (e.g. cc-switch) may have set ANTHROPIC_BASE_URL directly in the
   // environment rather than in settings.json — pick it up so the proxy forwards to the
@@ -316,6 +333,18 @@ async function wrap(command, args, opts) {
     if (settingsBaseUrl)
       process.stderr.write(`  \x1b[33mnote:\x1b[0m settings.json sets ${provider.envVar}=${settingsBaseUrl}; overriding it so claude hits the proxy\n`);
     args = ["--settings", JSON.stringify({ env: { [provider.envVar]: proxyUrl } }), ...args];
+  }
+
+  // Codex config.toml base_url outranks OPENAI_BASE_URL. Override it via -c
+  // so codex talks to our proxy instead of going direct.
+  if (codexBased && codexConfig) {
+    const configKey = `model_providers.${codexConfig.provider}.base_url`;
+    // Use proxyUrl (origin only, no path). Codex appends the endpoint path
+    // (e.g. /responses) to base_url. The upstream URL retains the /v1 prefix,
+    // so proxy receives /responses and correctly forwards to /v1/responses.
+    args = ["-c", `${configKey}="${proxyUrl}"`, ...args];
+    if (codexConfig.baseUrl)
+      process.stderr.write(`  \x1b[33mnote:\x1b[0m config.toml sets ${configKey}=${codexConfig.baseUrl}; overriding via -c\n`);
   }
 
   const spawnCmd = provider.command || command;
